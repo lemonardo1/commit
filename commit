@@ -1,0 +1,413 @@
+#!/usr/bin/env bash
+# commit - AI-powered git commit message generator
+# https://github.com/yourusername/commit
+
+set -euo pipefail
+
+CONFIG_DIR="$HOME/.commit"
+CONFIG_FILE="$CONFIG_DIR/config"
+VERSION="1.0.0"
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+info()    { echo -e "${BLUE}ℹ${NC}  $*"; }
+success() { echo -e "${GREEN}✓${NC}  $*"; }
+warn()    { echo -e "${YELLOW}⚠${NC}  $*"; }
+error()   { echo -e "${RED}✗${NC}  $*" >&2; }
+die()     { error "$*"; exit 1; }
+ask()     { echo -e "${CYAN}?${NC}  $*"; }
+
+# ── JSON helpers ──────────────────────────────────────────────────────────────
+json_escape() {
+  if command -v jq &>/dev/null; then
+    printf '%s' "$1" | jq -Rs .
+  elif command -v python3 &>/dev/null; then
+    python3 -c "import json,sys; print(json.dumps(sys.stdin.read()))" <<< "$1"
+  else
+    # basic escape fallback
+    printf '%s' "$1" \
+      | sed 's/\\/\\\\/g; s/"/\\"/g; s/$/\\n/g' \
+      | tr -d '\n' \
+      | sed 's/\\n$//' \
+      | sed 's/^/"/; s/$/"/'
+  fi
+}
+
+extract_json_field() {
+  local json="$1" field="$2"
+  if command -v jq &>/dev/null; then
+    echo "$json" | jq -r "$field" 2>/dev/null
+  elif command -v python3 &>/dev/null; then
+    python3 -c "
+import json, sys
+data = json.loads(sys.stdin.read())
+keys = '$field'.lstrip('.').split('.')
+val = data
+for k in keys:
+    if '[' in k:
+        name, idx = k.rstrip(']').split('[')
+        val = val[name][int(idx)]
+    else:
+        val = val[k]
+print(val)
+" <<< "$json"
+  else
+    die "jq or python3 is required. Install with: brew install jq"
+  fi
+}
+
+# ── Config ────────────────────────────────────────────────────────────────────
+load_config() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+  fi
+}
+
+save_config() {
+  mkdir -p "$CONFIG_DIR"
+  chmod 700 "$CONFIG_DIR"
+  cat > "$CONFIG_FILE" <<EOF
+AI_PROVIDER="${AI_PROVIDER:-}"
+AI_API_KEY="${AI_API_KEY:-}"
+AI_MODEL="${AI_MODEL:-}"
+EOF
+  chmod 600 "$CONFIG_FILE"
+}
+
+setup() {
+  echo ""
+  echo -e "${BOLD}commit${NC} — AI Commit Message Generator ${DIM}v${VERSION}${NC}"
+  echo -e "${DIM}──────────────────────────────────────────${NC}"
+  echo ""
+
+  ask "AI 제공자를 선택하세요:"
+  echo "  1) OpenAI (GPT-4o)"
+  echo "  2) Anthropic (Claude)"
+  echo ""
+  read -rp "  선택 [1-2]: " provider_choice
+
+  case "$provider_choice" in
+    1)
+      AI_PROVIDER="openai"
+      AI_MODEL="gpt-4o"
+      ask "OpenAI API 키를 입력하세요 (sk-...):"
+      read -rsp "  API Key: " AI_API_KEY
+      echo ""
+      ;;
+    2)
+      AI_PROVIDER="anthropic"
+      AI_MODEL="claude-opus-4-6"
+      ask "Anthropic API 키를 입력하세요 (sk-ant-...):"
+      read -rsp "  API Key: " AI_API_KEY
+      echo ""
+      ;;
+    *)
+      die "잘못된 선택입니다."
+      ;;
+  esac
+
+  if [[ -z "$AI_API_KEY" ]]; then
+    die "API 키를 입력해야 합니다."
+  fi
+
+  save_config
+  success "설정이 저장되었습니다. ($CONFIG_FILE)"
+  echo ""
+}
+
+# ── AI API calls ──────────────────────────────────────────────────────────────
+call_openai() {
+  local diff="$1"
+  local escaped_diff
+  escaped_diff=$(json_escape "$diff")
+
+  local prompt_json
+  prompt_json=$(json_escape "You are a git commit message expert. Analyze the following git diff and generate a concise, descriptive commit message in the conventional commits format (e.g., feat: ..., fix: ..., refactor: ..., docs: ..., etc.).
+
+Rules:
+- Write in English
+- First line: type(scope): short description (max 72 chars)
+- If needed, add a blank line then bullet points for details
+- Be specific and meaningful, not generic
+- Output ONLY the commit message, no extra explanation
+
+Git diff:
+$diff")
+
+  local payload="{
+    \"model\": \"${AI_MODEL}\",
+    \"messages\": [
+      {\"role\": \"user\", \"content\": ${prompt_json}}
+    ],
+    \"max_tokens\": 300,
+    \"temperature\": 0.3
+  }"
+
+  local response
+  response=$(curl -sS \
+    -H "Authorization: Bearer ${AI_API_KEY}" \
+    -H "Content-Type: application/json" \
+    -d "$payload" \
+    "https://api.openai.com/v1/chat/completions" 2>&1) || die "OpenAI API 호출 실패"
+
+  local message
+  message=$(extract_json_field "$response" ".choices[0].message.content") || {
+    local err
+    err=$(extract_json_field "$response" ".error.message" 2>/dev/null || echo "$response")
+    die "OpenAI 오류: $err"
+  }
+
+  echo "$message"
+}
+
+call_anthropic() {
+  local diff="$1"
+  local escaped_diff
+  escaped_diff=$(json_escape "$diff")
+
+  local prompt_json
+  prompt_json=$(json_escape "Analyze the following git diff and generate a concise, descriptive commit message in the conventional commits format (e.g., feat: ..., fix: ..., refactor: ..., docs: ..., etc.).
+
+Rules:
+- Write in English
+- First line: type(scope): short description (max 72 chars)
+- If needed, add a blank line then bullet points for details
+- Be specific and meaningful, not generic
+- Output ONLY the commit message, no extra explanation
+
+Git diff:
+$diff")
+
+  local payload="{
+    \"model\": \"${AI_MODEL}\",
+    \"max_tokens\": 300,
+    \"messages\": [
+      {\"role\": \"user\", \"content\": ${prompt_json}}
+    ]
+  }"
+
+  local response
+  response=$(curl -sS \
+    -H "x-api-key: ${AI_API_KEY}" \
+    -H "anthropic-version: 2023-06-01" \
+    -H "Content-Type: application/json" \
+    -d "$payload" \
+    "https://api.anthropic.com/v1/messages" 2>&1) || die "Anthropic API 호출 실패"
+
+  local message
+  message=$(extract_json_field "$response" ".content[0].text") || {
+    local err
+    err=$(extract_json_field "$response" ".error.message" 2>/dev/null || echo "$response")
+    die "Anthropic 오류: $err"
+  }
+
+  echo "$message"
+}
+
+generate_commit_message() {
+  local diff="$1"
+
+  # Truncate very large diffs (keep first 8000 chars)
+  if [[ ${#diff} -gt 8000 ]]; then
+    warn "diff가 너무 큽니다. 처음 8000자만 분석합니다."
+    diff="${diff:0:8000}
+... (truncated)"
+  fi
+
+  case "$AI_PROVIDER" in
+    openai)    call_openai "$diff" ;;
+    anthropic) call_anthropic "$diff" ;;
+    *)         die "알 수 없는 AI 제공자: $AI_PROVIDER" ;;
+  esac
+}
+
+# ── Git helpers ───────────────────────────────────────────────────────────────
+ensure_git_repo() {
+  if ! git rev-parse --git-dir &>/dev/null; then
+    warn "현재 디렉토리가 git 저장소가 아닙니다."
+    ask "git init을 실행할까요? [y/N]"
+    read -rp "  " choice
+    if [[ "${choice,,}" == "y" ]]; then
+      git init
+      success "git init 완료"
+    else
+      die "git 저장소가 필요합니다."
+    fi
+  fi
+}
+
+ensure_remote() {
+  if ! git remote get-url origin &>/dev/null; then
+    warn "원격 저장소(origin)가 설정되어 있지 않습니다."
+    ask "원격 저장소 URL을 입력하세요 (예: https://github.com/user/repo.git):"
+    read -rp "  URL: " remote_url
+    if [[ -z "$remote_url" ]]; then
+      die "원격 저장소 URL이 필요합니다."
+    fi
+    git remote add origin "$remote_url"
+    success "원격 저장소 추가됨: $remote_url"
+  fi
+}
+
+get_current_branch() {
+  git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main"
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+main() {
+  # Handle subcommands
+  case "${1:-}" in
+    setup|config)
+      setup
+      return 0
+      ;;
+    --version|-v)
+      echo "commit v${VERSION}"
+      return 0
+      ;;
+    --help|-h)
+      echo ""
+      echo -e "${BOLD}commit${NC} v${VERSION} — AI Commit Message Generator"
+      echo ""
+      echo "사용법:"
+      echo "  commit          # git add, AI 커밋 메시지 생성, push"
+      echo "  commit setup    # API 키 설정"
+      echo "  commit --help   # 도움말"
+      echo ""
+      return 0
+      ;;
+  esac
+
+  echo ""
+  echo -e "${BOLD}commit${NC} ${DIM}v${VERSION}${NC}"
+  echo -e "${DIM}──────────────────────────────────────────${NC}"
+  echo ""
+
+  # Load or create config
+  load_config
+  if [[ -z "${AI_API_KEY:-}" ]]; then
+    warn "API 키가 설정되어 있지 않습니다. 초기 설정을 시작합니다."
+    echo ""
+    setup
+    load_config
+  fi
+
+  # 1. Git repo check
+  ensure_git_repo
+
+  # 2. git add .
+  info "변경 파일 스테이징 중... (git add .)"
+  git add .
+
+  # 3. Check if there's anything to commit
+  if git diff --cached --quiet; then
+    warn "커밋할 변경 사항이 없습니다."
+    exit 0
+  fi
+
+  # Show staged files summary
+  echo ""
+  echo -e "${DIM}스테이징된 파일:${NC}"
+  git diff --cached --name-status | while IFS=$'\t' read -r status file; do
+    case "$status" in
+      A) echo -e "  ${GREEN}+${NC} $file" ;;
+      D) echo -e "  ${RED}-${NC} $file" ;;
+      M) echo -e "  ${YELLOW}~${NC} $file" ;;
+      *) echo -e "  ${DIM}?${NC} $file $status" ;;
+    esac
+  done
+  echo ""
+
+  # 4. Get diff
+  info "AI가 커밋 메시지를 생성 중..."
+  local diff
+  diff=$(git diff --cached)
+
+  # 5. Generate message
+  local commit_msg
+  commit_msg=$(generate_commit_message "$diff") || die "커밋 메시지 생성 실패"
+
+  # Strip leading/trailing whitespace
+  commit_msg=$(echo "$commit_msg" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+  echo ""
+  echo -e "${BOLD}생성된 커밋 메시지:${NC}"
+  echo -e "${DIM}──────────────────────────────────────────${NC}"
+  echo "$commit_msg"
+  echo -e "${DIM}──────────────────────────────────────────${NC}"
+  echo ""
+
+  # 6. Confirm or edit
+  ask "이 메시지로 커밋할까요? [Y/n/e(편집)]"
+  read -rp "  " choice
+
+  case "${choice,,}" in
+    n|no)
+      ask "직접 커밋 메시지를 입력하세요:"
+      read -rp "  " commit_msg
+      if [[ -z "$commit_msg" ]]; then
+        die "커밋 메시지를 입력해야 합니다."
+      fi
+      ;;
+    e|edit)
+      # Open in editor
+      local tmp_file
+      tmp_file=$(mktemp /tmp/commit_msg.XXXXXX)
+      echo "$commit_msg" > "$tmp_file"
+      "${EDITOR:-vi}" "$tmp_file"
+      commit_msg=$(cat "$tmp_file")
+      rm -f "$tmp_file"
+      if [[ -z "$commit_msg" ]]; then
+        die "커밋 메시지를 입력해야 합니다."
+      fi
+      ;;
+    *)
+      # Default: yes
+      ;;
+  esac
+
+  # 7. git commit
+  git commit -m "$commit_msg"
+  success "커밋 완료!"
+  echo ""
+
+  # 8. git push
+  ask "원격 저장소에 push할까요? [Y/n]"
+  read -rp "  " push_choice
+
+  if [[ "${push_choice,,}" != "n" && "${push_choice,,}" != "no" ]]; then
+    ensure_remote
+
+    local branch
+    branch=$(get_current_branch)
+
+    info "push 중... (origin/$branch)"
+
+    if ! git push origin "$branch" 2>&1; then
+      # Try with --set-upstream for new branches
+      warn "일반 push 실패. upstream 설정 후 재시도합니다."
+      if ! git push --set-upstream origin "$branch" 2>&1; then
+        die "push 실패. 원격 저장소 설정을 확인하세요."
+      fi
+    fi
+
+    success "push 완료! (origin/$branch)"
+  else
+    info "push를 건너뜁니다."
+  fi
+
+  echo ""
+  success "완료!"
+  echo ""
+}
+
+main "$@"
